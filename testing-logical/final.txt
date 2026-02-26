@@ -1,0 +1,133 @@
+ Using these flags were the fix for the EMR auto termination. Thank you for helping
+  --master yarn \
+  --deploy-mode client \
+  --driver-memory 5g \
+  --executor-memory 6g \
+  --num-executors 3 \
+  --executor-cores 3 \
+
+
+# SETUP Node:
+login_onehouse_dev
+dev_bastion_login
+
+cd
+export EMR_DNS="ip-10-0-82-95.us-west-2.compute.internal"
+# scp -o StrictHostKeyChecking=no -i ~/oh_ec2_key_pair.pem ~/oh_ec2_key_pair.pem hadoop@"$EMR_DNS":~/
+ssh -o StrictHostKeyChecking=no hadoop@"$EMR_DNS" -i oh_ec2_key_pair.pem
+
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/spark-3.5.0-bin-hadoop3.tgz .
+tar xvf spark-3.5.0-bin-hadoop3.tgz
+cd spark-3.5.0-bin-hadoop3 
+# pwd - /home/hadoop/spark-3.5.0-bin-hadoop3
+
+mkdir -p jars 
+curl https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.48/aws-java-sdk-bundle-1.12.48.jar --output jars/aws-java-sdk-bundle-1.12.48.jar
+chmod 644 jars/aws-java-sdk-bundle-1.12.48.jar
+curl https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.1/hadoop-aws-3.3.1.jar -o jars/hadoop-aws-3.3.1.jar                                      
+chmod 644 jars/hadoop-aws-3.3.1.jar
+cd ..
+
+export HADOOP_CONF_DIR=/etc/hadoop/conf
+sudo vi /etc/hadoop/conf/core-site.xml (remove lzo)
+touch /home/hadoop/empty.properties
+
+
+# SETUP Test:
+mkdir -p /home/hadoop/hudi-jars
+cd /home/hadoop/hudi-jars
+
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/hudi-spark3.5-bundle_2.12-0.15.0.jar .
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/hudi-utilities-slim-spark3.5-bundle_2.12-0.15.0.jar .
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/hudi-spark3.5-bundle_2.12-0.16.0-SNAPSHOT.jar .
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/hudi-utilities-slim-spark3.5-bundle_2.12-0.16.0-SNAPSHOT.jar .
+
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/initial_batch.scala \
+    /home/hadoop/
+
+aws s3 cp s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/incremental_batch_1.py \
+    /home/hadoop/
+
+/home/hadoop/spark-3.5.0-bin-hadoop3/bin/spark-shell \
+  --conf spark.driver.memory=4g \
+  --conf spark.executor.memory=11g \
+  --conf spark.executor.cores=3 \
+  --conf spark.executor.instances=3 \
+  --conf spark.sql.shuffle.partitions=200 \
+  --conf spark.default.parallelism=9 \
+  --conf spark.sql.adaptive.enabled=true \
+  -i /home/hadoop/initial_batch.scala
+
+
+/home/hadoop/spark-3.5.0-bin-hadoop3/bin/spark-shell \
+  --master yarn \
+  --deploy-mode client \
+  --conf spark.driver.memory=4g \
+  --conf spark.executor.memory=9g \
+  --conf spark.executor.cores=3 \
+  --conf spark.executor.instances=3 \
+  --conf spark.sql.shuffle.partitions=200 \
+  --conf spark.default.parallelism=9 \
+  --conf spark.sql.adaptive.enabled=true \
+  -i /home/hadoop/initial_batch.scala
+
+ingestion COW: 
+touch /home/hadoop/empty.properties
+time /home/hadoop/spark-3.5.0-bin-hadoop3/bin/spark-submit \
+  --conf spark.driver.memory=4g \
+  --conf spark.executor.memory=6g \
+  --conf spark.executor.cores=3 \
+  --conf spark.executor.instances=3 \
+  --conf spark.dynamicAllocation.enabled=true \
+  --conf spark.sql.adaptive.enabled=true \
+  --class org.apache.hudi.utilities.streamer.HoodieStreamer \
+  --jars /home/hadoop/hudi-jars/hudi-spark3.5-bundle_2.12-0.15.0.jar \
+  /home/hadoop/hudi-jars/hudi-utilities-slim-spark3.5-bundle_2.12-0.15.0.jar \
+  --props file:///home/hadoop/empty.properties \
+  --table-type COPY_ON_WRITE \
+  --source-class org.apache.hudi.utilities.sources.ParquetDFSSource \
+  --target-base-path s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/data/hudi_cow_logical \
+  --target-table hudi_cow_logical \
+  --schemaprovider-class org.apache.hudi.utilities.schema.FilebasedSchemaProvider \
+  --hoodie-conf hoodie.deltastreamer.source.dfs.root=s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/data/wide_500cols_10000parts \
+  --hoodie-conf hoodie.deltastreamer.schemaprovider.source.schema.file=s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/full_schema.avsc \
+  --hoodie-conf hoodie.deltastreamer.schemaprovider.target.schema.file=s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/full_schema.avsc \
+  --hoodie-conf hoodie.datasource.write.recordkey.field=col_1 \
+  --hoodie-conf hoodie.datasource.write.precombine.field=col_1 \
+  --hoodie-conf hoodie.datasource.write.partitionpath.field=partition_col \
+  --source-ordering-field col_1
+
+Terraform jobs are like only one instance in the workspace. so it will block other people
+
+Always copy the table / parquet file created from the S3 UI as it is faster and backup for future use. 
+
+Ingestion for MOR:
+
+time /home/hadoop/spark-3.5.0-bin-hadoop3/bin/spark-submit \
+  --master yarn \
+  --deploy-mode client \
+  --driver-memory 8g \
+  --executor-memory 6g \
+  --num-executors 3 \
+  --executor-cores 3 \
+  --jars /home/hadoop/hudi-jars/hudi-spark3.5-bundle_2.12-0.15.0.jar \
+  --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
+  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.hudi.catalog.HoodieCatalog \
+  --conf spark.sql.extensions=org.apache.spark.sql.hudi.HoodieSparkSessionExtension \
+  --conf spark.kryo.registrator=org.apache.spark.HoodieKryoRegistrator \
+  --conf spark.sql.adaptive.enabled=true \
+  --class org.apache.hudi.utilities.streamer.HoodieStreamer \
+  /home/hadoop/hudi-jars/hudi-utilities-slim-spark3.5-bundle_2.12-0.15.0.jar \
+  --table-type MERGE_ON_READ \
+  --props file:///home/hadoop/empty.properties \
+  --target-base-path s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/data/hudi_mor_logical \
+  --target-table hudi_mor_logical \
+  --source-class org.apache.hudi.utilities.sources.ParquetDFSSource \
+  --schemaprovider-class org.apache.hudi.utilities.schema.FilebasedSchemaProvider \
+  --hoodie-conf hoodie.deltastreamer.source.dfs.root=s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/data/wide_500cols_10000parts \
+  --hoodie-conf hoodie.deltastreamer.schemaprovider.source.schema.file=s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/full_schema.avsc \
+  --hoodie-conf hoodie.deltastreamer.schemaprovider.target.schema.file=s3://performance-benchmark-datasets-us-west-2/hudi-bench/pavijars/full_schema.avsc \
+  --hoodie-conf hoodie.datasource.write.recordkey.field=col_1 \
+  --hoodie-conf hoodie.datasource.write.precombine.field=col_1 \
+  --hoodie-conf hoodie.datasource.write.partitionpath.field=partition_col \
+  --source-ordering-field col_1
